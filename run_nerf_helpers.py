@@ -53,7 +53,7 @@ def get_embedder(multires, i=0):
                 'include_input' : True,
                 'input_dims' : 3,
                 'max_freq_log2' : multires-1,
-                'num_freqs' : multires,
+                'num_freqs' : multires,                     # ccc: 编码中，sin/cos函数的频率倍数，从sin(2^0 pai x)一直到sin(2^multires pai x)
                 'log_sampling' : True,
                 'periodic_fns' : [torch.sin, torch.cos],
     }
@@ -76,6 +76,9 @@ class NeRF(nn.Module):
         self.skips = skips
         self.use_viewdirs = use_viewdirs
         
+        # ccc: 网络结构论文有写，8层的总MLP。只接受3维的位置编码作为输入，输出的结果首先被用于接入self.alpha_linear直接出透明度，（透明度只和位置有关）
+        # 其次还被用于接入self.feature_linear提出256维特征向量，再加入视角信息，一起接入self.views_linears，再接入self.rgb_linear得到最后的rgb颜色。
+        # 其中第6层会把原始输入重新接入网络，可以理解为类似残差的设计？
         self.pts_linears = nn.ModuleList(
             [nn.Linear(input_ch, W)] + [nn.Linear(W, W) if i not in self.skips else nn.Linear(W + input_ch, W) for i in range(D-1)])
         

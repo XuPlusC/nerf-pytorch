@@ -178,6 +178,9 @@ def render_path(render_poses, hwf, K, chunk, render_kwargs, gt_imgs=None, savedi
 def create_nerf(args):
     """Instantiate NeRF's MLP model.
     """
+    # ccc: 这个embedder是用来做位置编码的。
+    # embed_fn 是编码函数，其输出大概就是把输入的x做各种傅里叶(不同频率的sin cos)变换以后的结果组成的列表
+    # input_ch 就是上述输出结果——也就是位置编码结果——的维度。
     embed_fn, input_ch = get_embedder(args.multires, args.i_embed)
 
     input_ch_views = 0
@@ -672,7 +675,7 @@ def train():
             return
 
     # Prepare raybatch tensor if batching random rays
-    N_rand = args.N_rand
+    N_rand = args.N_rand        # ccc: 这个就是batchsize，每一次放入网络的光线个数
     use_batching = not args.no_batching
     if use_batching:
         # For random ray batching
