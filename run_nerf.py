@@ -105,7 +105,7 @@ def render(H, W, K, chunk=1024*32, rays=None, c2w=None, ndc=True,
         if c2w_staticcam is not None:
             # special case to visualize effect of viewdirs
             rays_o, rays_d = get_rays(H, W, K, c2w_staticcam)
-        viewdirs = viewdirs / torch.norm(viewdirs, dim=-1, keepdim=True)
+        viewdirs = viewdirs / torch.norm(viewdirs, dim=-1, keepdim=True)    # ccc : 归一化后的光线射线坐标
         viewdirs = torch.reshape(viewdirs, [-1,3]).float()
 
     sh = rays_d.shape # [..., 3]
@@ -276,11 +276,11 @@ def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False, pytest=F
         depth_map: [num_rays]. Estimated distance to object.
     """
     raw2alpha = lambda raw, dists, act_fn=F.relu: 1.-torch.exp(-act_fn(raw)*dists)
-
+    # ccc : dists是（经过随机扰动的）采样点之间的距离。其最后一个值是1e10，作为边界。
     dists = z_vals[...,1:] - z_vals[...,:-1]
     dists = torch.cat([dists, torch.Tensor([1e10]).expand(dists[...,:1].shape)], -1)  # [N_rays, N_samples]
 
-    dists = dists * torch.norm(rays_d[...,None,:], dim=-1)
+    dists = dists * torch.norm(rays_d[...,None,:], dim=-1) # ccc : 这是干嘛？dist乘以光线方向的世界坐标的二范数
 
     rgb = torch.sigmoid(raw[...,:3])  # [N_rays, N_samples, 3]
     noise = 0.
@@ -353,7 +353,7 @@ def render_rays(ray_batch,
     """
     N_rays = ray_batch.shape[0]
     rays_o, rays_d = ray_batch[:,0:3], ray_batch[:,3:6] # [N_rays, 3] each
-    viewdirs = ray_batch[:,-3:] if ray_batch.shape[-1] > 8 else None
+    viewdirs = ray_batch[:,-3:] if ray_batch.shape[-1] > 8 else None # ccc : 这是归一化的光线射线矢量
     bounds = torch.reshape(ray_batch[...,6:8], [-1,1,2])
     near, far = bounds[...,0], bounds[...,1] # [-1,1]
 
@@ -363,10 +363,10 @@ def render_rays(ray_batch,
     else:
         z_vals = 1./(1./near * (1.-t_vals) + 1./far * (t_vals))
 
-    z_vals = z_vals.expand([N_rays, N_samples])
+    z_vals = z_vals.expand([N_rays, N_samples])     # ccc : z_vals就是处于[near, far]区间内的N_samples个采样点
 
     if perturb > 0.:
-        # get intervals between samples
+        # get intervals between samples # ccc: 把z_vals里的N_samples个采样点加上随机扰动
         mids = .5 * (z_vals[...,1:] + z_vals[...,:-1])
         upper = torch.cat([mids, z_vals[...,-1:]], -1)
         lower = torch.cat([z_vals[...,:1], mids], -1)
@@ -680,7 +680,7 @@ def train():
     if use_batching:
         # For random ray batching
         print('get rays')
-        rays = np.stack([get_rays_np(H, W, K, p) for p in poses[:,:3,:4]], 0) # [N, ro+rd, H, W, 3]
+        rays = np.stack([get_rays_np(H, W, K, p) for p in poses[:,:3,:4]], 0) # [N, ro+rd, H, W, 3]     # ccc: 根据get_rays_np函数，pose就是c2w矩阵
         print('done, concats')
         rays_rgb = np.concatenate([rays, images[:,None]], 1) # [N, ro+rd+rgb, H, W, 3]
         rays_rgb = np.transpose(rays_rgb, [0,2,3,1,4]) # [N, H, W, ro+rd+rgb, 3]
@@ -735,7 +735,7 @@ def train():
             target = torch.Tensor(target).to(device)
             pose = poses[img_i, :3,:4]
 
-            if N_rand is not None:
+            if N_rand is not None:  # ccc : 下面是世界坐标下的光心坐标和光线射线坐标
                 rays_o, rays_d = get_rays(H, W, K, torch.Tensor(pose))  # (H, W, 3), (H, W, 3)
 
                 if i < args.precrop_iters:
@@ -751,7 +751,10 @@ def train():
                 else:
                     coords = torch.stack(torch.meshgrid(torch.linspace(0, H-1, H), torch.linspace(0, W-1, W)), -1)  # (H, W, 2)
 
-                coords = torch.reshape(coords, [-1,2])  # (H * W, 2)
+                # ccc : 从当前图的像素坐标系下所有点中随机选择N_rand个，将他们的像素坐标存入select_coords，
+                # 并将世界坐标系下的光心坐标rays_o和光线射线坐标rays_d都筛得只剩下这些随机出来的点
+                # 组装成光线向量batch_rays，和这些随机点的真实rgb色值张量target_s
+                coords = torch.reshape(coords, [-1,2])  # (H * W, 2) 
                 select_inds = np.random.choice(coords.shape[0], size=[N_rand], replace=False)  # (N_rand,)
                 select_coords = coords[select_inds].long()  # (N_rand, 2)
                 rays_o = rays_o[select_coords[:, 0], select_coords[:, 1]]  # (N_rand, 3)
