@@ -18,6 +18,8 @@ from load_deepvoxels import load_dv_data
 from load_blender import load_blender_data
 from load_LINEMOD import load_LINEMOD_data
 
+import cv2
+import mvs.depth_map_operate as depthOP
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 np.random.seed(0)
@@ -69,6 +71,7 @@ def batchify_rays(rays_flat, chunk=1024*32, **kwargs):
 def render(H, W, K, chunk=1024*32, rays=None, c2w=None, ndc=True,
                   near=0., far=1.,
                   use_viewdirs=False, c2w_staticcam=None,
+                  depth_map=None,
                   **kwargs):
     """Render rays
     Args:
@@ -86,6 +89,7 @@ def render(H, W, K, chunk=1024*32, rays=None, c2w=None, ndc=True,
       use_viewdirs: bool. If True, use viewing direction of a point in space in model.
       c2w_staticcam: array of shape [3, 4]. If not None, use this transformation matrix for 
        camera while using other c2w argument for viewing directions.
+      depth_map: [cococat exp]array of shape[H, W], depth map of the reference image
     Returns:
       rgb_map: [batch_size, 3]. Predicted RGB values for rays.
       disp_map: [batch_size]. Disparity map. Inverse of depth.
@@ -247,6 +251,7 @@ def create_nerf(args):
         'use_viewdirs' : args.use_viewdirs,
         'white_bkgd' : args.white_bkgd,
         'raw_noise_std' : args.raw_noise_std,
+        'depth_prior':args.depth_prior,
     }
 
     # NDC only good for LLFF-style forward facing data
@@ -320,7 +325,8 @@ def render_rays(ray_batch,
                 white_bkgd=False,
                 raw_noise_std=0.,
                 verbose=False,
-                pytest=False):
+                pytest=False,
+                depth_prior=False):
     """Volumetric rendering.
     Args:
       ray_batch: array of shape [batch_size, ...]. All information necessary
@@ -387,6 +393,9 @@ def render_rays(ray_batch,
 #     raw = run_network(pts)
     raw = network_query_fn(pts, viewdirs, network_fn)
     rgb_map, disp_map, acc_map, weights, depth_map = raw2outputs(raw, z_vals, rays_d, raw_noise_std, white_bkgd, pytest=pytest)
+
+    # if depth_prior:
+    #     print("weee lets go")
 
     if N_importance > 0:
 
@@ -531,6 +540,10 @@ def config_parser():
     parser.add_argument("--i_video",   type=int, default=50000, 
                         help='frequency of render_poses video saving')
 
+    # cococat experiment
+    parser.add_argument("--depth_prior", action='store_true', 
+                        help='[COCOCAT EXPERIMENT]extra fine sample using depth prior')
+
     return parser
 
 
@@ -577,6 +590,8 @@ def train():
         near = 2.
         far = 6.
 
+        # 接下来的步骤只考虑rgb，所以需要把α通道移除，将rgb通道修改为经过透明度计算的结果
+        # 线性插值公式：αA + (1-α)B。在这个场景下，A即是读取到的颜色值r/g/b，B即白色背景的颜色值1（读取时对255做了归一化）
         if args.white_bkgd:
             images = images[...,:3]*images[...,-1:] + (1.-images[...,-1:])
         else:
@@ -609,6 +624,9 @@ def train():
     else:
         print('Unknown dataset type', args.dataset_type, 'exiting')
         return
+
+    # cococat: load depthmap
+    depth_maps = depthOP.load_depth_map_ACMM("/home/rec/Experiment/ACMM/Fern/ACMM/", args.factor)
 
     # Cast intrinsics to right types
     H, W, focal = hwf
@@ -713,6 +731,7 @@ def train():
     start = start + 1
     for i in trange(start, N_iters):
         time0 = time.time()
+        depth_map = None
 
         # Sample random ray batch
         if use_batching:
@@ -734,6 +753,14 @@ def train():
             target = images[img_i]
             target = torch.Tensor(target).to(device)
             pose = poses[img_i, :3,:4]
+            # ccc exp: choose the corresponding depth map and send to device
+            if args.depth_prior:
+                if len(depth_maps) > img_i:
+                    depth_map = depth_maps[img_i]
+                else:
+                    print("[WARNING] Cannot find corresponding depth map. Depth prior may not work.")
+            if depth_map is not None:
+                dpeth_map = torch.Tensor(depth_map).to(device)
 
             if N_rand is not None:  # ccc : 下面是世界坐标下的光心坐标和光线射线坐标
                 rays_o, rays_d = get_rays(H, W, K, torch.Tensor(pose))  # (H, W, 3), (H, W, 3)
@@ -765,6 +792,7 @@ def train():
         #####  Core optimization loop  #####
         rgb, disp, acc, extras = render(H, W, K, chunk=args.chunk, rays=batch_rays,
                                                 verbose=i < 10, retraw=True,
+                                                depth_map=depth_map,   # 这里不需要depth_prior参数，已经被包在下面的kwargs
                                                 **render_kwargs_train)
 
         optimizer.zero_grad()
