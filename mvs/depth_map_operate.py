@@ -94,16 +94,20 @@ def load_depth_map_ACMM(ACMM_root_folder, scale_factor=1):
 
     for home, dirs, files in os.walk(ACMM_root_folder):
         for subdir in sorted(dirs):
+            new_depth_map = []
             # depth map with geometry consistency has priority
             geom_depth_path = ACMM_root_folder + subdir + "/" + "depths_geom.dmb"
             if os.path.exists(geom_depth_path) :
                 depth_paths.append(geom_depth_path)
-                depth_maps.append(read_single_depth_ACMM(geom_depth_path, scale_factor))
+                new_depth_map.append(read_single_depth_ACMM(geom_depth_path, scale_factor))
+                depth_maps.append(new_depth_map)
                 continue
 
             regular_depth_path = ACMM_root_folder + subdir + "/" + "depths.dmb"
             if os.path.exists(regular_depth_path) :
                 depth_paths.append(regular_depth_path)
-                depth_maps.append(read_single_depth_ACMM(regular_depth_path, scale_factor))
+                new_depth_map.append(read_single_depth_ACMM(regular_depth_path, scale_factor))
+                depth_maps.append(new_depth_map)
 
+    depth_maps = np.concatenate(depth_maps, 0)
     return depth_maps

@@ -53,12 +53,12 @@ def run_network(inputs, viewdirs, fn, embed_fn, embeddirs_fn, netchunk=1024*64):
     return outputs
 
 
-def batchify_rays(rays_flat, chunk=1024*32, **kwargs):
+def batchify_rays(rays_flat, chunk=1024*32, use_depth_prior=False, **kwargs):
     """Render rays in smaller minibatches to avoid OOM.
     """
     all_ret = {}
     for i in range(0, rays_flat.shape[0], chunk):
-        ret = render_rays(rays_flat[i:i+chunk], **kwargs)
+        ret = render_rays(rays_flat[i:i+chunk],  use_depth_prior=use_depth_prior, **kwargs)
         for k in ret:
             if k not in all_ret:
                 all_ret[k] = []
@@ -71,7 +71,7 @@ def batchify_rays(rays_flat, chunk=1024*32, **kwargs):
 def render(H, W, K, chunk=1024*32, rays=None, c2w=None, ndc=True,
                   near=0., far=1.,
                   use_viewdirs=False, c2w_staticcam=None,
-                  depth_map=None,
+                  use_depth_prior=False,
                   **kwargs):
     """Render rays
     Args:
@@ -89,7 +89,7 @@ def render(H, W, K, chunk=1024*32, rays=None, c2w=None, ndc=True,
       use_viewdirs: bool. If True, use viewing direction of a point in space in model.
       c2w_staticcam: array of shape [3, 4]. If not None, use this transformation matrix for 
        camera while using other c2w argument for viewing directions.
-      depth_map: [cococat exp]array of shape[H, W], depth map of the reference image
+      use_depth_prior: [cococat exp]bool, whether the render procedure should use depth prior
     Returns:
       rgb_map: [batch_size, 3]. Predicted RGB values for rays.
       disp_map: [batch_size]. Disparity map. Inverse of depth.
@@ -99,9 +99,11 @@ def render(H, W, K, chunk=1024*32, rays=None, c2w=None, ndc=True,
     if c2w is not None:
         # special case to render full image
         rays_o, rays_d = get_rays(H, W, K, c2w)
+        rays_depth = None
     else:
         # use provided ray batch
-        rays_o, rays_d = rays
+        # rays_o, rays_d = rays
+        rays_o, rays_d, rays_depth = rays
 
     if use_viewdirs:
         # provide ray directions as input
@@ -113,21 +115,32 @@ def render(H, W, K, chunk=1024*32, rays=None, c2w=None, ndc=True,
         viewdirs = torch.reshape(viewdirs, [-1,3]).float()
 
     sh = rays_d.shape # [..., 3]
+    origin_delta = rays_d - rays_o
+    origin_norm = torch.norm(origin_delta, p=2, dim=1, keepdim=True)
     if ndc:
         # for forward facing scenes
         rays_o, rays_d = ndc_rays(H, W, K[0][0], 1., rays_o, rays_d)
+        new_delta = rays_d - rays_o
+        new_norm = torch.norm(new_delta, p=2, dim=1, keepdim=True)
 
     # Create ray batch
     rays_o = torch.reshape(rays_o, [-1,3]).float()
     rays_d = torch.reshape(rays_d, [-1,3]).float()
+    if use_depth_prior is True:
+        rays_depth = torch.reshape(rays_depth, [-1,3]).float()
 
     near, far = near * torch.ones_like(rays_d[...,:1]), far * torch.ones_like(rays_d[...,:1])
-    rays = torch.cat([rays_o, rays_d, near, far], -1)
+    # rays = torch.cat([rays_o, rays_d, near, far], -1)
+    if use_depth_prior is True:
+        rays = torch.cat([rays_o, rays_d, near, far, rays_depth], -1)
+    else:
+        rays = torch.cat([rays_o, rays_d, near, far], -1)
+
     if use_viewdirs:
         rays = torch.cat([rays, viewdirs], -1)
 
     # Render and reshape
-    all_ret = batchify_rays(rays, chunk, **kwargs)
+    all_ret = batchify_rays(rays, chunk, use_depth_prior=use_depth_prior, **kwargs)
     for k in all_ret:
         k_sh = list(sh[:-1]) + list(all_ret[k].shape[1:])
         all_ret[k] = torch.reshape(all_ret[k], k_sh)
@@ -326,6 +339,7 @@ def render_rays(ray_batch,
                 raw_noise_std=0.,
                 verbose=False,
                 pytest=False,
+                use_depth_prior=False,
                 depth_prior=False):
     """Volumetric rendering.
     Args:
@@ -357,8 +371,16 @@ def render_rays(ray_batch,
       z_std: [num_rays]. Standard deviation of distances along ray for each
         sample.
     """
+    # N_rays = ray_batch.shape[0]
+    # # rays_o, rays_d = ray_batch[:,0:3], ray_batch[:,3:6] # [N_rays, 3] each
+    # rays_o, rays_d, rays_depth = ray_batch[:,0:3], ray_batch[:,3:6], ray_batch[:,8] # [N_rays, 3] each
+    # viewdirs = ray_batch[:,-3:] if ray_batch.shape[-1] > 8 else None # ccc : 这是归一化的光线射线矢量
+    # bounds = torch.reshape(ray_batch[...,6:8], [-1,1,2])
+    # near, far = bounds[...,0], bounds[...,1] # [-1,1]
+
     N_rays = ray_batch.shape[0]
-    rays_o, rays_d = ray_batch[:,0:3], ray_batch[:,3:6] # [N_rays, 3] each
+    # rays_o, rays_d = ray_batch[:,0:3], ray_batch[:,3:6] # [N_rays, 3] each
+    rays_o, rays_d, rays_depth = ray_batch[:,0:3], ray_batch[:,3:6], ray_batch[:,8:11] # [N_rays, 3] each
     viewdirs = ray_batch[:,-3:] if ray_batch.shape[-1] > 8 else None # ccc : 这是归一化的光线射线矢量
     bounds = torch.reshape(ray_batch[...,6:8], [-1,1,2])
     near, far = bounds[...,0], bounds[...,1] # [-1,1]
@@ -387,6 +409,48 @@ def render_rays(ray_batch,
 
         z_vals = lower + (upper - lower) * t_rand
 
+    # ccc exp：根据深度先验额外采样N_samples个点
+    if depth_prior and N_samples > 0:
+        prior_sample_near = rays_depth[..., 0] # [N_rays]
+        prior_sample_far = rays_depth[..., 1] # [N_rays]
+
+        prior_sample_near = prior_sample_near[:, None].expand(N_rays, N_samples)
+        prior_sample_far = prior_sample_far[:, None].expand(N_rays, N_samples)
+
+        prior_sample_t_vals = torch.linspace(0., 1., steps=N_samples) 
+        prior_sample_t_vals = prior_sample_t_vals.expand(N_rays, N_samples)
+
+        prior_sample_near = prior_sample_near * (torch.ones_like(prior_sample_t_vals) - prior_sample_t_vals)
+        prior_sample_far = prior_sample_far *  prior_sample_t_vals
+
+        p_sample_t_vals = torch.stack((prior_sample_near, prior_sample_far), dim=-1) # [N_rays, N_samples, 2]
+        p_sample_t_vals = torch.sum(p_sample_t_vals, dim=-1) # [N_rays, N_samples, 1]
+        p_sample_t_vals = p_sample_t_vals.squeeze()  # [N_rays, N_samples]
+
+
+        # new_t_vals = torch.linspace(0., 1., steps=N_samples) 
+        # if not lindisp:
+        #     new_zvals = extra_near * (1.-new_t_vals) + extra_far * (new_t_vals)
+        # else:
+        #     new_zvals = 1./(1./extra_near * (1.-new_t_vals) + 1./extra_far * (new_t_vals))
+
+        # # new_zvals = new_zvals.expand([N_rays, N_samples]) # [N_rays, N_samples]
+        # get intervals between samples # ccc: 把z_vals里的N_samples个采样点加上随机扰动
+        mids = .5 * (p_sample_t_vals[...,1:] + p_sample_t_vals[...,:-1])  # [N_rays, N_samples]
+        upper = torch.cat([mids, p_sample_t_vals[...,-1:]], -1) # [N_rays, N_samples]
+        lower = torch.cat([p_sample_t_vals[...,:1], mids], -1) # [N_rays, N_samples]
+        # stratified samples in those intervals
+        t_rand = torch.rand(p_sample_t_vals.shape)
+
+        # Pytest, overwrite u with numpy's fixed random numbers
+        if pytest:
+            np.random.seed(0)
+            t_rand = np.random.rand(*list(p_sample_t_vals.shape))
+            t_rand = torch.Tensor(t_rand)
+
+        p_sample_t_vals = lower + (upper - lower) * t_rand  # [N_rays, N_samples]
+        # z_vals, _ = torch.sort(torch.cat([z_vals, p_sample_t_vals], -1), -1)
+    
     pts = rays_o[...,None,:] + rays_d[...,None,:] * z_vals[...,:,None] # [N_rays, N_samples, 3]
 
 
@@ -394,34 +458,34 @@ def render_rays(ray_batch,
     raw = network_query_fn(pts, viewdirs, network_fn)
     rgb_map, disp_map, acc_map, weights, depth_map = raw2outputs(raw, z_vals, rays_d, raw_noise_std, white_bkgd, pytest=pytest)
 
-    # if depth_prior:
-    #     print("weee lets go")
 
-    if N_importance > 0:
+#   # ccc exp : no more fine network
+#     if N_importance > 0:
 
-        rgb_map_0, disp_map_0, acc_map_0 = rgb_map, disp_map, acc_map
+#         rgb_map_0, disp_map_0, acc_map_0 = rgb_map, disp_map, acc_map
 
-        z_vals_mid = .5 * (z_vals[...,1:] + z_vals[...,:-1])
-        z_samples = sample_pdf(z_vals_mid, weights[...,1:-1], N_importance, det=(perturb==0.), pytest=pytest)
-        z_samples = z_samples.detach()
+#         z_vals_mid = .5 * (z_vals[...,1:] + z_vals[...,:-1])
+#         z_samples = sample_pdf(z_vals_mid, weights[...,1:-1], N_importance, det=(perturb==0.), pytest=pytest)
+#         z_samples = z_samples.detach()
 
-        z_vals, _ = torch.sort(torch.cat([z_vals, z_samples], -1), -1)
-        pts = rays_o[...,None,:] + rays_d[...,None,:] * z_vals[...,:,None] # [N_rays, N_samples + N_importance, 3]
+#         z_vals, _ = torch.sort(torch.cat([z_vals, z_samples], -1), -1)
+#         pts = rays_o[...,None,:] + rays_d[...,None,:] * z_vals[...,:,None] # [N_rays, N_samples + N_importance, 3]
 
-        run_fn = network_fn if network_fine is None else network_fine
-#         raw = run_network(pts, fn=run_fn)
-        raw = network_query_fn(pts, viewdirs, run_fn)
+#         run_fn = network_fn if network_fine is None else network_fine
+# #         raw = run_network(pts, fn=run_fn)
+#         raw = network_query_fn(pts, viewdirs, run_fn)
 
-        rgb_map, disp_map, acc_map, weights, depth_map = raw2outputs(raw, z_vals, rays_d, raw_noise_std, white_bkgd, pytest=pytest)
+#         rgb_map, disp_map, acc_map, weights, depth_map = raw2outputs(raw, z_vals, rays_d, raw_noise_std, white_bkgd, pytest=pytest)
 
     ret = {'rgb_map' : rgb_map, 'disp_map' : disp_map, 'acc_map' : acc_map}
     if retraw:
         ret['raw'] = raw
-    if N_importance > 0:
-        ret['rgb0'] = rgb_map_0
-        ret['disp0'] = disp_map_0
-        ret['acc0'] = acc_map_0
-        ret['z_std'] = torch.std(z_samples, dim=-1, unbiased=False)  # [N_rays]
+    #   # ccc exp : no more fine network
+    # if N_importance > 0:
+    #     ret['rgb0'] = rgb_map_0
+    #     ret['disp0'] = disp_map_0
+    #     ret['acc0'] = acc_map_0
+    #     ret['z_std'] = torch.std(z_samples, dim=-1, unbiased=False)  # [N_rays]
 
     for k in ret:
         if (torch.isnan(ret[k]).any() or torch.isinf(ret[k]).any()) and DEBUG:
@@ -543,7 +607,10 @@ def config_parser():
     # cococat experiment
     parser.add_argument("--depth_prior", action='store_true', 
                         help='[COCOCAT EXPERIMENT]extra fine sample using depth prior')
-
+    parser.add_argument("--prior_dir", type=str, default='None', 
+                        help='[COCOCAT EXPERIMENT]depth prior data directory')
+    parser.add_argument("--prior_percentile", type=float,
+                        default=.05, help='[COCOCAT EXPERIMENT] percentile of prior sampling along ray') 
     return parser
 
 
@@ -555,7 +622,7 @@ def train():
     # Load data
     K = None
     if args.dataset_type == 'llff':
-        images, poses, bds, render_poses, i_test = load_llff_data(args.datadir, args.factor,
+        images, poses, bds, render_poses, i_test, depth_scale = load_llff_data(args.datadir, args.factor,
                                                                   recenter=True, bd_factor=.75,
                                                                   spherify=args.spherify)
         hwf = poses[0,:3,-1]
@@ -625,9 +692,6 @@ def train():
         print('Unknown dataset type', args.dataset_type, 'exiting')
         return
 
-    # cococat: load depthmap
-    depth_maps = depthOP.load_depth_map_ACMM("/home/rec/Experiment/ACMM/Fern/ACMM/", args.factor)
-
     # Cast intrinsics to right types
     H, W, focal = hwf
     H, W = int(H), int(W)
@@ -639,6 +703,40 @@ def train():
             [0, focal, 0.5*H],
             [0, 0, 1]
         ])
+
+    # cococat: load depthmap
+    if args.prior_dir == "None":
+        print("No prior path set. exiting")
+        return
+
+    depth_maps = depthOP.load_depth_map_ACMM(args.prior_dir, args.factor) # [N, H, W]
+    depth_maps = depth_scale * depth_maps
+    avg_depth = np.mean(depth_maps, axis=2)
+    avg_depth = np.mean(avg_depth, axis=1)
+    avg_depth = np.mean(avg_depth, axis=0)
+    print("avg depth" + str(avg_depth))
+
+    # depth_maps = depthOP.load_depth_map_ACMM("/home/rec/Experiment/ACMM/fern_factor8/ACMM/") # [N, H, W]
+    
+    # cococat: project all depth map points to world coordinate
+    i, j = np.meshgrid(np.arange(W, dtype=np.float32), np.arange(H, dtype=np.float32), indexing='xy')
+    x_cam_coord = (i-K[0][2])/K[0][0]
+    y_cam_coord = -(j-K[1][2])/K[1][1]
+    x_cam_coord = np.broadcast_to(x_cam_coord[...,np.newaxis], (depth_maps.shape[0], H, W, 1)) # [N, H, W, 1]
+    y_cam_coord = np.broadcast_to(y_cam_coord[...,np.newaxis], (depth_maps.shape[0], H, W, 1)) # [N, H, W, 1]
+    x_cam_coord = x_cam_coord * depth_maps[...,np.newaxis]
+    y_cam_coord = y_cam_coord * depth_maps[...,np.newaxis]
+    depth_cam_coord = np.concatenate((x_cam_coord, y_cam_coord), -1) # [N, H, W, 2], depth points in image coordinate
+
+    # depth_cam_coord = np.stack([(i-K[0][2])/K[0][0], -(j-K[1][2])/K[1][1]], -1)  # [H, W, 2]
+    # depth_cam_coord = np.broadcast_to(depth_cam_coord, (depth_maps.shape[0], H, W, 2)) # [N, H, W, 2]
+    depth_cam_coord = np.concatenate((depth_cam_coord, -depth_maps[...,np.newaxis]), -1) # [N, H, W, 3], depth points in image coordinate
+    # depth_world_coord = np.sum(dirs[..., np.newaxis, :] * c2w[:3,:3], -1)  # dot product, equals to: [c2w.dot(dir) for dir in dirs]
+    rotate_pose = poses[..., :3] # [N, 3, 3] following function "get_rays_np" in run_nerf_helpers.py
+    rotate_pose = np.expand_dims(rotate_pose,1).repeat(W,axis=1) # [N, W, 3, 3]
+    rotate_pose = np.expand_dims(rotate_pose,1).repeat(H,axis=1) # [N, H, W, 3, 3]
+    depth_world_coord = np.matmul(rotate_pose, depth_cam_coord[..., np.newaxis])
+    depth_world_coord = depth_world_coord.squeeze()
 
     if args.render_test:
         render_poses = np.array(poses[i_test])
@@ -700,13 +798,62 @@ def train():
         print('get rays')
         rays = np.stack([get_rays_np(H, W, K, p) for p in poses[:,:3,:4]], 0) # [N, ro+rd, H, W, 3]     # ccc: 根据get_rays_np函数，pose就是c2w矩阵
         print('done, concats')
-        rays_rgb = np.concatenate([rays, images[:,None]], 1) # [N, ro+rd+rgb, H, W, 3]
-        rays_rgb = np.transpose(rays_rgb, [0,2,3,1,4]) # [N, H, W, ro+rd+rgb, 3]
-        rays_rgb = np.stack([rays_rgb[i] for i in i_train], 0) # train images only
-        rays_rgb = np.reshape(rays_rgb, [-1,3,3]) # [(N-1)*H*W, ro+rd+rgb, 3]
-        rays_rgb = rays_rgb.astype(np.float32)
+
+        # ccc exp: 根据深度先验世界坐标，确定深度采样的范围
+        rays_o, rays_d = rays[:, 0], rays[:, 1] # [N, H, W, 3]
+        vec_d2o = rays_d - rays_o
+        vec_p2o = depth_world_coord - rays_o # 'p' for prior
+        dist_d2o = np.linalg.norm(vec_d2o, ord=2, axis=3, keepdims=True) # [N, H, W, 1]
+        dist_p2o = np.linalg.norm(vec_p2o, ord=2, axis=3, keepdims=True) # [N, H, W, 1]
+        inner_product = vec_d2o * vec_p2o
+        inner_product = np.sum(inner_product, -1)
+        inner_product = np.expand_dims(inner_product, 3)  # [N, H, W, 1]
+        prior_confidence = inner_product / (np.linalg.norm(vec_d2o, ord=2, axis=3, keepdims=True) * np.linalg.norm(vec_p2o, ord=2, axis=3, keepdims=True))
+
+        dist_near_far_plane = args.prior_percentile * (far - near) * np.ones_like(dist_d2o)
+        prior_sample_near = dist_p2o / dist_d2o - dist_near_far_plane
+        prior_sample_far = dist_p2o / dist_d2o + dist_near_far_plane
+        prior_sample_plane = np.concatenate([prior_sample_near, prior_sample_far], -1)  
+
+        bad_count = 0
+        for image_index in range(dist_d2o.shape[0]):
+            for row_index in range(dist_d2o.shape[1]):
+                for col_index in range(dist_d2o.shape[2]):
+                    if prior_confidence[image_index, row_index, col_index, 0] < 0.9659 or prior_sample_plane[image_index, row_index, col_index, 0] > far or prior_sample_plane[image_index, row_index, col_index, 1] < near :
+                        prior_sample_plane[image_index, row_index, col_index, 0] = near
+                        prior_sample_plane[image_index, row_index, col_index, 1] = far
+                        bad_count += 1
+
+        all_pixels = dist_d2o.shape[0] * dist_d2o.shape[1] * dist_d2o.shape[2]
+        print("all prior pixels: " + str(all_pixels))
+        print("bad prior pixels: " + str(bad_count))
+        print("good prior rate: " + str((float(all_pixels) - bad_count) / all_pixels * 100) + "%")
+        prior_sample_all_info = np.concatenate([prior_sample_plane, dist_p2o], -1) # [N, H, W, 3]
+        prior_sample_all_info = np.expand_dims(prior_sample_all_info, 1)  # [N, 1, H, W, 3]
+
+        # # original verrsion of nerf rays batch
+        # rays_rgb = np.concatenate([rays, images[:,None]], 1) # [N, ro+rd+rgb, H, W, 3]
+        # rays_rgb = np.transpose(rays_rgb, [0,2,3,1,4]) # [N, H, W, ro+rd+rgb, 3]
+        # rays_rgb = np.stack([rays_rgb[i] for i in i_train], 0) # train images only
+        # rays_rgb = np.reshape(rays_rgb, [-1,3,3]) # [(N-1)*H*W, ro+rd+rgb, 3]
+        # rays_rgb = rays_rgb.astype(np.float32)
+        # print('shuffle rays')
+        # np.random.shuffle(rays_rgb)
+
+        rays_depth = np.concatenate([rays, prior_sample_all_info], 1) # [N, ro+rd+depth, H, W, 3]
+        rays_depth_rgb = np.concatenate([rays_depth, images[:,None]], 1) # [N, ro+rd+depth+rgb, H, W, 3]
+        rays_depth_rgb = np.transpose(rays_depth_rgb, [0,2,3,1,4]) # [N, H, W, ro+rd+depth+rgb, 3]
+        rays_depth_rgb = np.stack([rays_depth_rgb[i] for i in i_train], 0) # train images only
+        rays_depth_rgb = np.reshape(rays_depth_rgb, [-1,4,3]) # [(N-1)*H*W, ro+rd+depth+rgb, 3]
+        rays_depth_rgb = rays_depth_rgb.astype(np.float32)
+        # rays_rgb = np.concatenate([rays, images[:,None]], 1) # [N, ro+rd+rgb, H, W, 3]
+        # rays_rgb_depth = np.concatenate([rays_rgb, depth_maps], 1) # [N, ro+rd+rgb+depth, H, W, 3]
+        # rays_rgb_depth = np.transpose(rays_rgb_depth, [0,2,3,1,4]) # [N, H, W, ro+rd+rgb+depth, 3]
+        # rays_rgb_depth = np.stack([rays_rgb_depth[i] for i in i_train], 0) # train images only
+        # rays_rgb_depth = np.reshape(rays_rgb_depth, [-1,4,3]) # [(N-1)*H*W, ro+rd+rgb+depth, 3]
+        # rays_rgb_depth = rays_rgb_depth.astype(np.float32)
         print('shuffle rays')
-        np.random.shuffle(rays_rgb)
+        np.random.shuffle(rays_depth_rgb)
 
         print('done')
         i_batch = 0
@@ -716,7 +863,8 @@ def train():
         images = torch.Tensor(images).to(device)
     poses = torch.Tensor(poses).to(device)
     if use_batching:
-        rays_rgb = torch.Tensor(rays_rgb).to(device)
+        # rays_rgb = torch.Tensor(rays_rgb).to(device)
+        rays_depth_rgb = torch.Tensor(rays_depth_rgb).to(device)
 
 
     N_iters = 200000 + 1
@@ -729,22 +877,28 @@ def train():
     # writer = SummaryWriter(os.path.join(basedir, 'summaries', expname))
     
     start = start + 1
+    timer_started = True
+    time0 = time.time()
     for i in trange(start, N_iters):
-        time0 = time.time()
+        if not timer_started:
+            timer_started = True
+            time0 = time.time()
+
         depth_map = None
 
         # Sample random ray batch
         if use_batching:
             # Random over all images
-            batch = rays_rgb[i_batch:i_batch+N_rand] # [B, 2+1, 3*?]
+            batch = rays_depth_rgb[i_batch:i_batch+N_rand] # [B, 2+1, 3*?] ccc: [B, 2+1+1(depth), 3]
             batch = torch.transpose(batch, 0, 1)
-            batch_rays, target_s = batch[:2], batch[2]
+            # batch_rays, target_s = batch[:2], batch[2]
+            batch_rays, target_s = batch[:3], batch[3]
 
             i_batch += N_rand
-            if i_batch >= rays_rgb.shape[0]:
+            if i_batch >= rays_depth_rgb.shape[0]:
                 print("Shuffle data after an epoch!")
-                rand_idx = torch.randperm(rays_rgb.shape[0])
-                rays_rgb = rays_rgb[rand_idx]
+                rand_idx = torch.randperm(rays_depth_rgb.shape[0])
+                rays_depth_rgb = rays_depth_rgb[rand_idx]
                 i_batch = 0
 
         else:
@@ -760,7 +914,7 @@ def train():
                 else:
                     print("[WARNING] Cannot find corresponding depth map. Depth prior may not work.")
             if depth_map is not None:
-                dpeth_map = torch.Tensor(depth_map).to(device)
+                dpeth_map = torch.Tensor(depth_map).to(device)  # TODO:这里似乎已经不需要传入深度图了，深度信息已经被包裹于rays
 
             if N_rand is not None:  # ccc : 下面是世界坐标下的光心坐标和光线射线坐标
                 rays_o, rays_d = get_rays(H, W, K, torch.Tensor(pose))  # (H, W, 3), (H, W, 3)
@@ -781,6 +935,7 @@ def train():
                 # ccc : 从当前图的像素坐标系下所有点中随机选择N_rand个，将他们的像素坐标存入select_coords，
                 # 并将世界坐标系下的光心坐标rays_o和光线射线坐标rays_d都筛得只剩下这些随机出来的点
                 # 组装成光线向量batch_rays，和这些随机点的真实rgb色值张量target_s
+                # TODO: 这边的batch还没加入深度信息
                 coords = torch.reshape(coords, [-1,2])  # (H * W, 2) 
                 select_inds = np.random.choice(coords.shape[0], size=[N_rand], replace=False)  # (N_rand,)
                 select_coords = coords[select_inds].long()  # (N_rand, 2)
@@ -788,11 +943,13 @@ def train():
                 rays_d = rays_d[select_coords[:, 0], select_coords[:, 1]]  # (N_rand, 3)
                 batch_rays = torch.stack([rays_o, rays_d], 0)
                 target_s = target[select_coords[:, 0], select_coords[:, 1]]  # (N_rand, 3)
+                batch
 
         #####  Core optimization loop  #####
         rgb, disp, acc, extras = render(H, W, K, chunk=args.chunk, rays=batch_rays,
                                                 verbose=i < 10, retraw=True,
-                                                depth_map=depth_map,   # 这里不需要depth_prior参数，已经被包在下面的kwargs
+                                                # depth_map=None,   # TODO:这里似乎已经不需要传入深度图了，深度信息已经被包裹于rays
+                                                use_depth_prior=True,
                                                 **render_kwargs_train)
 
         optimizer.zero_grad()
@@ -825,15 +982,31 @@ def train():
         # Rest is logging
         if i%args.i_weights==0:
             path = os.path.join(basedir, expname, '{:06d}.tar'.format(i))
-            torch.save({
-                'global_step': global_step,
-                'network_fn_state_dict': render_kwargs_train['network_fn'].state_dict(),
-                'network_fine_state_dict': render_kwargs_train['network_fine'].state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-            }, path)
+            if render_kwargs_train['network_fine'] is not None:
+                torch.save({
+                    'global_step': global_step,
+                    'network_fn_state_dict': render_kwargs_train['network_fn'].state_dict(),
+                    'network_fine_state_dict': render_kwargs_train['network_fine'].state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                }, path)
+            else:
+                torch.save({
+                    'global_step': global_step,
+                    'network_fn_state_dict': render_kwargs_train['network_fn'].state_dict(),
+                    # 'network_fine_state_dict': render_kwargs_train['network_fine'].state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                }, path)
             print('Saved checkpoints at', path)
 
         if i%args.i_video==0 and i > 0:
+            timer_started = False
+            time_elapsed = time.time()-time0
+            str_time_info = '{:d} iters done, {:.0f}m {:.0f}s passed. PSNR: {:.5f}'.format(i, time_elapsed // 60, time_elapsed % 60, psnr.item())
+            time_file = os.path.join(basedir, expname, 'time.txt')
+            with open(time_file, 'a+') as f:
+                f.write(str_time_info +'\n')
+
+
             # Turn on testing mode
             with torch.no_grad():
                 rgbs, disps = render_path(render_poses, hwf, K, args.chunk, render_kwargs_test)
