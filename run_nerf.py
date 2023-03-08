@@ -20,6 +20,7 @@ from load_LINEMOD import load_LINEMOD_data
 
 import cv2
 import mvs.depth_map_operate as depthOP
+import math
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 np.random.seed(0)
@@ -53,12 +54,13 @@ def run_network(inputs, viewdirs, fn, embed_fn, embeddirs_fn, netchunk=1024*64):
     return outputs
 
 
-def batchify_rays(rays_flat, chunk=1024*32, use_depth_prior=False, **kwargs):
+def batchify_rays(rays_flat, chunk=1024*32, use_depth_prior=False, depth_sample_percentile=1., **kwargs):
     """Render rays in smaller minibatches to avoid OOM.
     """
     all_ret = {}
     for i in range(0, rays_flat.shape[0], chunk):
-        ret = render_rays(rays_flat[i:i+chunk],  use_depth_prior=use_depth_prior, **kwargs)
+        ret = render_rays(rays_flat[i:i+chunk], 
+                use_depth_prior=use_depth_prior, depth_sample_percentile=depth_sample_percentile, **kwargs)
         for k in ret:
             if k not in all_ret:
                 all_ret[k] = []
@@ -72,6 +74,7 @@ def render(H, W, K, chunk=1024*32, rays=None, c2w=None, ndc=True,
                   near=0., far=1.,
                   use_viewdirs=False, c2w_staticcam=None,
                   use_depth_prior=False,
+                  depth_sample_percentile=1.,
                   **kwargs):
     """Render rays
     Args:
@@ -140,7 +143,7 @@ def render(H, W, K, chunk=1024*32, rays=None, c2w=None, ndc=True,
         rays = torch.cat([rays, viewdirs], -1)
 
     # Render and reshape
-    all_ret = batchify_rays(rays, chunk, use_depth_prior=use_depth_prior, **kwargs)
+    all_ret = batchify_rays(rays, chunk, use_depth_prior=use_depth_prior, depth_sample_percentile=depth_sample_percentile, **kwargs)
     for k in all_ret:
         k_sh = list(sh[:-1]) + list(all_ret[k].shape[1:])
         all_ret[k] = torch.reshape(all_ret[k], k_sh)
@@ -340,7 +343,8 @@ def render_rays(ray_batch,
                 verbose=False,
                 pytest=False,
                 use_depth_prior=False,
-                depth_prior=False):
+                depth_prior=False,
+                depth_sample_percentile = 1.):
     """Volumetric rendering.
     Args:
       ray_batch: array of shape [batch_size, ...]. All information necessary
@@ -385,6 +389,10 @@ def render_rays(ray_batch,
     bounds = torch.reshape(ray_batch[...,6:8], [-1,1,2])
     near, far = bounds[...,0], bounds[...,1] # [-1,1]
 
+    prior_N_samples = math.ceil(N_samples * depth_sample_percentile)
+    if depth_prior and use_depth_prior and prior_N_samples > 1:
+        N_samples =  math.ceil(N_samples * (1- depth_sample_percentile))
+
     t_vals = torch.linspace(0., 1., steps=N_samples)
     if not lindisp:
         z_vals = near * (1.-t_vals) + far * (t_vals)
@@ -409,23 +417,28 @@ def render_rays(ray_batch,
 
         z_vals = lower + (upper - lower) * t_rand
 
-    # ccc exp：根据深度先验额外采样N_samples个点
-    if depth_prior and N_samples > 0:
+    # ccc exp：根据深度先验额外采样prior_N_samples个点
+    # prior_N_samples = math.ceil(N_samples * depth_sample_percentile)
+    if depth_prior and use_depth_prior and prior_N_samples > 1:
+    # if depth_prior and N_samples > 0:
         prior_sample_near = rays_depth[..., 0] # [N_rays]
         prior_sample_far = rays_depth[..., 1] # [N_rays]
 
-        prior_sample_near = prior_sample_near[:, None].expand(N_rays, N_samples)
-        prior_sample_far = prior_sample_far[:, None].expand(N_rays, N_samples)
+        prior_sample_near = prior_sample_near[:, None].expand(N_rays, prior_N_samples)
+        prior_sample_far = prior_sample_far[:, None].expand(N_rays, prior_N_samples)
 
-        prior_sample_t_vals = torch.linspace(0., 1., steps=N_samples) 
-        prior_sample_t_vals = prior_sample_t_vals.expand(N_rays, N_samples)
+        prior_sample_t_vals = torch.linspace(0., 1., steps=prior_N_samples) 
+        prior_sample_t_vals = prior_sample_t_vals.expand(N_rays, prior_N_samples)
 
         prior_sample_near = prior_sample_near * (torch.ones_like(prior_sample_t_vals) - prior_sample_t_vals)
         prior_sample_far = prior_sample_far *  prior_sample_t_vals
 
-        p_sample_t_vals = torch.stack((prior_sample_near, prior_sample_far), dim=-1) # [N_rays, N_samples, 2]
-        p_sample_t_vals = torch.sum(p_sample_t_vals, dim=-1) # [N_rays, N_samples, 1]
-        p_sample_t_vals = p_sample_t_vals.squeeze()  # [N_rays, N_samples]
+        p_sample_t_vals = torch.stack((prior_sample_near, prior_sample_far), dim=-1) # [N_rays, prior_N_samples, 2]
+        p_sample_t_vals = torch.sum(p_sample_t_vals, dim=-1) # [N_rays, prior_N_samples, 1]
+        p_sample_t_vals = p_sample_t_vals.squeeze()  # [N_rays, prior_N_samples]
+
+        if len(p_sample_t_vals.shape) == 1: # 处理 prior_N_samples = 1的情况，被squeeze成了1维。为了拼接还得升维
+            p_sample_t_vals = p_sample_t_vals[:, None]
 
 
         # new_t_vals = torch.linspace(0., 1., steps=N_samples) 
@@ -436,9 +449,9 @@ def render_rays(ray_batch,
 
         # # new_zvals = new_zvals.expand([N_rays, N_samples]) # [N_rays, N_samples]
         # get intervals between samples # ccc: 把z_vals里的N_samples个采样点加上随机扰动
-        mids = .5 * (p_sample_t_vals[...,1:] + p_sample_t_vals[...,:-1])  # [N_rays, N_samples]
-        upper = torch.cat([mids, p_sample_t_vals[...,-1:]], -1) # [N_rays, N_samples]
-        lower = torch.cat([p_sample_t_vals[...,:1], mids], -1) # [N_rays, N_samples]
+        mids = .5 * (p_sample_t_vals[...,1:] + p_sample_t_vals[...,:-1])  # [N_rays, prior_N_samples]
+        upper = torch.cat([mids, p_sample_t_vals[...,-1:]], -1) # [N_rays, prior_N_samples]
+        lower = torch.cat([p_sample_t_vals[...,:1], mids], -1) # [N_rays, prior_N_samples]
         # stratified samples in those intervals
         t_rand = torch.rand(p_sample_t_vals.shape)
 
@@ -448,8 +461,8 @@ def render_rays(ray_batch,
             t_rand = np.random.rand(*list(p_sample_t_vals.shape))
             t_rand = torch.Tensor(t_rand)
 
-        p_sample_t_vals = lower + (upper - lower) * t_rand  # [N_rays, N_samples]
-        # z_vals, _ = torch.sort(torch.cat([z_vals, p_sample_t_vals], -1), -1)
+        p_sample_t_vals = lower + (upper - lower) * t_rand  # [N_rays, prior_N_samples]
+        z_vals, _ = torch.sort(torch.cat([z_vals, p_sample_t_vals], -1), -1)
     
     pts = rays_o[...,None,:] + rays_d[...,None,:] * z_vals[...,:,None] # [N_rays, N_samples, 3]
 
@@ -459,33 +472,32 @@ def render_rays(ray_batch,
     rgb_map, disp_map, acc_map, weights, depth_map = raw2outputs(raw, z_vals, rays_d, raw_noise_std, white_bkgd, pytest=pytest)
 
 
-#   # ccc exp : no more fine network
-#     if N_importance > 0:
+    if N_importance > 0:
 
-#         rgb_map_0, disp_map_0, acc_map_0 = rgb_map, disp_map, acc_map
+        rgb_map_0, disp_map_0, acc_map_0 = rgb_map, disp_map, acc_map
 
-#         z_vals_mid = .5 * (z_vals[...,1:] + z_vals[...,:-1])
-#         z_samples = sample_pdf(z_vals_mid, weights[...,1:-1], N_importance, det=(perturb==0.), pytest=pytest)
-#         z_samples = z_samples.detach()
+        z_vals_mid = .5 * (z_vals[...,1:] + z_vals[...,:-1])
+        z_samples = sample_pdf(z_vals_mid, weights[...,1:-1], N_importance, det=(perturb==0.), pytest=pytest)
+        z_samples = z_samples.detach()
 
-#         z_vals, _ = torch.sort(torch.cat([z_vals, z_samples], -1), -1)
-#         pts = rays_o[...,None,:] + rays_d[...,None,:] * z_vals[...,:,None] # [N_rays, N_samples + N_importance, 3]
+        z_vals, _ = torch.sort(torch.cat([z_vals, z_samples], -1), -1)
+        pts = rays_o[...,None,:] + rays_d[...,None,:] * z_vals[...,:,None] # [N_rays, N_samples + N_importance, 3]
 
-#         run_fn = network_fn if network_fine is None else network_fine
-# #         raw = run_network(pts, fn=run_fn)
-#         raw = network_query_fn(pts, viewdirs, run_fn)
+        run_fn = network_fn if network_fine is None else network_fine
+#         raw = run_network(pts, fn=run_fn)
+        raw = network_query_fn(pts, viewdirs, run_fn)
 
-#         rgb_map, disp_map, acc_map, weights, depth_map = raw2outputs(raw, z_vals, rays_d, raw_noise_std, white_bkgd, pytest=pytest)
+        rgb_map, disp_map, acc_map, weights, depth_map = raw2outputs(raw, z_vals, rays_d, raw_noise_std, white_bkgd, pytest=pytest)
 
-    ret = {'rgb_map' : rgb_map, 'disp_map' : disp_map, 'acc_map' : acc_map}
+    ret = {'rgb_map' : rgb_map, 'disp_map' : disp_map, 'acc_map' : acc_map, 'depth_map' : depth_map}
     if retraw:
         ret['raw'] = raw
-    #   # ccc exp : no more fine network
-    # if N_importance > 0:
-    #     ret['rgb0'] = rgb_map_0
-    #     ret['disp0'] = disp_map_0
-    #     ret['acc0'] = acc_map_0
-    #     ret['z_std'] = torch.std(z_samples, dim=-1, unbiased=False)  # [N_rays]
+    # ccc exp : no more fine network
+    if N_importance > 0:
+        ret['rgb0'] = rgb_map_0
+        ret['disp0'] = disp_map_0
+        ret['acc0'] = acc_map_0
+        ret['z_std'] = torch.std(z_samples, dim=-1, unbiased=False)  # [N_rays]
 
     for k in ret:
         if (torch.isnan(ret[k]).any() or torch.isinf(ret[k]).any()) and DEBUG:
@@ -709,14 +721,23 @@ def train():
         print("No prior path set. exiting")
         return
 
-    depth_maps = depthOP.load_depth_map_ACMM(args.prior_dir, args.factor) # [N, H, W]
+    depth_maps, fused_depth_maps = depthOP.load_depth_map_ACMM(args.prior_dir, args.factor) # [N, H, W]
     depth_maps = depth_scale * depth_maps
     avg_depth = np.mean(depth_maps, axis=2)
     avg_depth = np.mean(avg_depth, axis=1)
     avg_depth = np.mean(avg_depth, axis=0)
-    print("avg depth" + str(avg_depth))
+    print("full depth map avg depth: " + str(avg_depth))
 
-    # depth_maps = depthOP.load_depth_map_ACMM("/home/rec/Experiment/ACMM/fern_factor8/ACMM/") # [N, H, W]
+    fused_depth_available = True
+    if fused_depth_maps is None:
+        fused_depth_available = False
+    
+    if fused_depth_available:
+        fused_depth_maps = depth_scale * fused_depth_maps
+        avg_depth = np.mean(fused_depth_maps, axis=2)
+        avg_depth = np.mean(avg_depth, axis=1)
+        avg_depth = np.mean(avg_depth, axis=0)
+        print("fused depth map avg depth: " + str(avg_depth))
     
     # cococat: project all depth map points to world coordinate
     i, j = np.meshgrid(np.arange(W, dtype=np.float32), np.arange(H, dtype=np.float32), indexing='xy')
@@ -737,6 +758,24 @@ def train():
     rotate_pose = np.expand_dims(rotate_pose,1).repeat(H,axis=1) # [N, H, W, 3, 3]
     depth_world_coord = np.matmul(rotate_pose, depth_cam_coord[..., np.newaxis])
     depth_world_coord = depth_world_coord.squeeze()
+
+    # same projection for fused depth
+    if fused_depth_available:
+        i, j = np.meshgrid(np.arange(W, dtype=np.float32), np.arange(H, dtype=np.float32), indexing='xy')
+        x_cam_coord = (i-K[0][2])/K[0][0]
+        y_cam_coord = -(j-K[1][2])/K[1][1]
+        x_cam_coord = np.broadcast_to(x_cam_coord[...,np.newaxis], (fused_depth_maps.shape[0], H, W, 1)) # [N, H, W, 1]
+        y_cam_coord = np.broadcast_to(y_cam_coord[...,np.newaxis], (fused_depth_maps.shape[0], H, W, 1)) # [N, H, W, 1]
+        x_cam_coord = x_cam_coord * fused_depth_maps[...,np.newaxis]
+        y_cam_coord = y_cam_coord * fused_depth_maps[...,np.newaxis]
+        fused_depth_cam_coord = np.concatenate((x_cam_coord, y_cam_coord), -1) # [N, H, W, 2], depth points in image coordinate
+
+        fused_depth_cam_coord = np.concatenate((fused_depth_cam_coord, -fused_depth_maps[...,np.newaxis]), -1) # [N, H, W, 3], depth points in image coordinate
+        rotate_pose = poses[..., :3] # [N, 3, 3] following function "get_rays_np" in run_nerf_helpers.py
+        rotate_pose = np.expand_dims(rotate_pose,1).repeat(W,axis=1) # [N, W, 3, 3]
+        rotate_pose = np.expand_dims(rotate_pose,1).repeat(H,axis=1) # [N, H, W, 3, 3]
+        fused_depth_world_coord = np.matmul(rotate_pose, fused_depth_cam_coord[..., np.newaxis])
+        fused_depth_world_coord = fused_depth_world_coord.squeeze()
 
     if args.render_test:
         render_poses = np.array(poses[i_test])
@@ -816,6 +855,7 @@ def train():
         prior_sample_plane = np.concatenate([prior_sample_near, prior_sample_far], -1)  
 
         bad_count = 0
+        floor_count = 0
         for image_index in range(dist_d2o.shape[0]):
             for row_index in range(dist_d2o.shape[1]):
                 for col_index in range(dist_d2o.shape[2]):
@@ -823,12 +863,20 @@ def train():
                         prior_sample_plane[image_index, row_index, col_index, 0] = near
                         prior_sample_plane[image_index, row_index, col_index, 1] = far
                         bad_count += 1
+                    if prior_sample_plane[image_index, row_index, col_index, 0] < near :
+                        prior_sample_plane[image_index, row_index, col_index, 0] = near
+                        floor_count += 1
+                    if prior_sample_plane[image_index, row_index, col_index, 1] > far:
+                        prior_sample_plane[image_index, row_index, col_index, 1] = far
+                        floor_count += 1
+
 
         all_pixels = dist_d2o.shape[0] * dist_d2o.shape[1] * dist_d2o.shape[2]
         print("all prior pixels: " + str(all_pixels))
         print("bad prior pixels: " + str(bad_count))
         print("good prior rate: " + str((float(all_pixels) - bad_count) / all_pixels * 100) + "%")
-        prior_sample_all_info = np.concatenate([prior_sample_plane, dist_p2o], -1) # [N, H, W, 3]
+        print("floor prior count: " + str(floor_count))
+        prior_sample_all_info = np.concatenate([prior_sample_plane, depth_maps[..., np.newaxis]], -1) # [N, H, W, 3]
         prior_sample_all_info = np.expand_dims(prior_sample_all_info, 1)  # [N, 1, H, W, 3]
 
         # # original verrsion of nerf rays batch
@@ -840,18 +888,55 @@ def train():
         # print('shuffle rays')
         # np.random.shuffle(rays_rgb)
 
+        # ccc exp: 将融合后的深度也进行投影
+        if fused_depth_available:
+            # rays_o, rays_d = rays[:, 0], rays[:, 1] # [N, H, W, 3]
+            # vec_d2o = rays_d - rays_o
+            # dist_d2o = np.linalg.norm(vec_d2o, ord=2, axis=3, keepdims=True) # [N, H, W, 1]
+            vec_fp2o = fused_depth_world_coord - rays_o # 'fp' for fused prior
+            dist_fp2o = np.linalg.norm(vec_fp2o, ord=2, axis=3, keepdims=True) # [N, H, W, 1]
+            fp_inner_product = vec_d2o * vec_fp2o
+            fp_inner_product = np.sum(fp_inner_product, -1)
+            fp_inner_product = np.expand_dims(fp_inner_product, 3)  # [N, H, W, 1]
+            fused_prior_confidence = fp_inner_product / (np.linalg.norm(vec_d2o, ord=2, axis=3, keepdims=True) * np.linalg.norm(vec_fp2o, ord=2, axis=3, keepdims=True))
+
+            # dist_near_far_plane = args.prior_percentile * (far - near) * np.ones_like(dist_d2o)
+            fused_prior_sample_near = dist_fp2o / dist_d2o - dist_near_far_plane
+            fused_prior_sample_far = dist_fp2o / dist_d2o + dist_near_far_plane
+            fused_prior_sample_plane = np.concatenate([fused_prior_sample_near, fused_prior_sample_far], -1)  
+
+            bad_count = 0
+            floor_count = 0
+            for image_index in range(dist_d2o.shape[0]):
+                for row_index in range(dist_d2o.shape[1]):
+                    for col_index in range(dist_d2o.shape[2]):
+                        if fused_prior_confidence[image_index, row_index, col_index, 0] < 0.9659 or fused_prior_sample_plane[image_index, row_index, col_index, 0] > far or fused_prior_sample_plane[image_index, row_index, col_index, 1] < near :
+                            fused_prior_sample_plane[image_index, row_index, col_index, 0] = near
+                            fused_prior_sample_plane[image_index, row_index, col_index, 1] = far
+                            bad_count += 1
+                        if fused_prior_sample_plane[image_index, row_index, col_index, 0] < near :
+                            fused_prior_sample_plane[image_index, row_index, col_index, 0] = near
+                            floor_count += 1
+                        if fused_prior_sample_plane[image_index, row_index, col_index, 1] > far:
+                            fused_prior_sample_plane[image_index, row_index, col_index, 1] = far
+                            floor_count += 1
+            
+            print("all prior pixels: " + str(all_pixels))
+            print("bad fused prior pixels: " + str(bad_count))
+            print("good fused prior rate: " + str((float(all_pixels) - bad_count) / all_pixels * 100) + "%")
+            print("floor fused prior count: " + str(floor_count))
+            fused_prior_sample_all_info = np.concatenate([fused_prior_sample_plane, fused_depth_maps[..., np.newaxis]], -1) # [N, H, W, 3]
+            fused_prior_sample_all_info = np.expand_dims(fused_prior_sample_all_info, 1)  # [N, 1, H, W, 3]
+            prior_sample_all_info = np.concatenate([prior_sample_all_info, fused_prior_sample_all_info], 1) # [N, depth+fused_depth(2), H, W, 3]
+
         rays_depth = np.concatenate([rays, prior_sample_all_info], 1) # [N, ro+rd+depth, H, W, 3]
         rays_depth_rgb = np.concatenate([rays_depth, images[:,None]], 1) # [N, ro+rd+depth+rgb, H, W, 3]
         rays_depth_rgb = np.transpose(rays_depth_rgb, [0,2,3,1,4]) # [N, H, W, ro+rd+depth+rgb, 3]
         rays_depth_rgb = np.stack([rays_depth_rgb[i] for i in i_train], 0) # train images only
-        rays_depth_rgb = np.reshape(rays_depth_rgb, [-1,4,3]) # [(N-1)*H*W, ro+rd+depth+rgb, 3]
+        # rays_depth_rgb = np.reshape(rays_depth_rgb, [-1,4,3]) # [(N-1)*H*W, ro+rd+depth+rgb, 3]
+        rays_depth_rgb = np.reshape(rays_depth_rgb, [-1,5,3]) # [(N-1)*H*W, ro+rd+depth+f_depth+rgb, 3]
+
         rays_depth_rgb = rays_depth_rgb.astype(np.float32)
-        # rays_rgb = np.concatenate([rays, images[:,None]], 1) # [N, ro+rd+rgb, H, W, 3]
-        # rays_rgb_depth = np.concatenate([rays_rgb, depth_maps], 1) # [N, ro+rd+rgb+depth, H, W, 3]
-        # rays_rgb_depth = np.transpose(rays_rgb_depth, [0,2,3,1,4]) # [N, H, W, ro+rd+rgb+depth, 3]
-        # rays_rgb_depth = np.stack([rays_rgb_depth[i] for i in i_train], 0) # train images only
-        # rays_rgb_depth = np.reshape(rays_rgb_depth, [-1,4,3]) # [(N-1)*H*W, ro+rd+rgb+depth, 3]
-        # rays_rgb_depth = rays_rgb_depth.astype(np.float32)
         print('shuffle rays')
         np.random.shuffle(rays_depth_rgb)
 
@@ -879,6 +964,14 @@ def train():
     start = start + 1
     timer_started = True
     time0 = time.time()
+    need_prior_assist=True
+    depth_sample_percentile=1.
+    depth_sample_decrease=0.005
+    coarse_depth_prior_assist=True # 最初由粗糙深度指导采样，随后如果存在融合深度，则切换成融合深度
+    fused_depth_prior_assist=False
+    # if fused_depth_available:
+    #     fused_depth_prior_assist=True
+
     for i in trange(start, N_iters):
         if not timer_started:
             timer_started = True
@@ -891,8 +984,12 @@ def train():
             # Random over all images
             batch = rays_depth_rgb[i_batch:i_batch+N_rand] # [B, 2+1, 3*?] ccc: [B, 2+1+1(depth), 3]
             batch = torch.transpose(batch, 0, 1)
-            # batch_rays, target_s = batch[:2], batch[2]
-            batch_rays, target_s = batch[:3], batch[3]
+            # batch_rays, target_s = batch[:3], batch[-1]
+            rays_o_d, coarse_depth, fused_depth, target_s = batch[:2], batch[2], batch[-2], batch[-1]
+            if fused_depth_prior_assist: # 
+                batch_rays = torch.cat([rays_o_d, fused_depth[None, ...]], dim=0)
+            else:
+                batch_rays = torch.cat([rays_o_d, coarse_depth[None, ...]], dim=0)
 
             i_batch += N_rand
             if i_batch >= rays_depth_rgb.shape[0]:
@@ -949,8 +1046,58 @@ def train():
         rgb, disp, acc, extras = render(H, W, K, chunk=args.chunk, rays=batch_rays,
                                                 verbose=i < 10, retraw=True,
                                                 # depth_map=None,   # TODO:这里似乎已经不需要传入深度图了，深度信息已经被包裹于rays
-                                                use_depth_prior=True,
+                                                use_depth_prior=need_prior_assist,
+                                                depth_sample_percentile=depth_sample_percentile,
                                                 **render_kwargs_train)
+        
+        if i%args.i_print==0 and i >= 25000 and args.depth_prior and need_prior_assist:
+            batch_depths = batch_rays[2, :, 2].clone().detach().cpu().numpy()
+            nerf_depths = extras['depth_map'].clone().detach().cpu().numpy() # [B]
+            depth_diff = 0.0
+            valid_prior_count = 0
+            for depth_iter in range(batch_depths.shape[0]):
+                if(batch_depths[depth_iter] != 0):
+                    depth_diff = depth_diff + abs(batch_depths[depth_iter] - nerf_depths[depth_iter])
+                    valid_prior_count = valid_prior_count + 1
+
+            depth_diff = depth_diff / ((far - near) * valid_prior_count)
+            # depth_diff = np.absolute(np.sum(depth_diff))
+            if depth_diff < 0.0675:
+                depth_sample_decrease = 0.08
+            elif depth_diff < 0.125:
+                depth_sample_decrease = 0.04
+            elif depth_diff < 0.25:
+                depth_sample_decrease = 0.02
+            elif depth_diff < 0.50:
+                depth_sample_decrease = 0.01
+            else:
+                depth_sample_decrease = 0.005
+            depth_sample_percentile = depth_sample_percentile - depth_sample_decrease
+            print("depth_sample_percentile set to " + str(depth_sample_percentile))
+            
+            if depth_sample_percentile <= 0.:
+                time_file = os.path.join(basedir, expname, 'time.txt')
+                if fused_depth_prior_assist is True:
+                    need_prior_assist = False
+                    with open(time_file, 'a+') as f:
+                        f.write('fused prior disabled at iter ' + str(i) +'\n')
+                        f.write('end of prior guide\n')
+                else :
+                    if fused_depth_available is True:
+                        # fused depth availble. switching to fused depth for sampling guide
+                        coarse_depth_prior_assist = False
+                        fused_depth_prior_assist = True
+                        depth_sample_percentile=1.
+                        depth_sample_decrease=0.005
+                        with open(time_file, 'a+') as f:
+                            f.write('fused prior disabled at iter ' + str(i) +'\n')
+                            f.write('switching to fused depth\n')
+                    else:
+                        # no fused depth available. time to end prior guide
+                        need_prior_assist = False
+                        with open(time_file, 'a+') as f:
+                            f.write('coarse prior disabled at iter ' + str(i) +'\n')
+                            f.write('end of prior guide\n')
 
         optimizer.zero_grad()
         img_loss = img2mse(rgb, target_s)
@@ -999,14 +1146,6 @@ def train():
             print('Saved checkpoints at', path)
 
         if i%args.i_video==0 and i > 0:
-            timer_started = False
-            time_elapsed = time.time()-time0
-            str_time_info = '{:d} iters done, {:.0f}m {:.0f}s passed. PSNR: {:.5f}'.format(i, time_elapsed // 60, time_elapsed % 60, psnr.item())
-            time_file = os.path.join(basedir, expname, 'time.txt')
-            with open(time_file, 'a+') as f:
-                f.write(str_time_info +'\n')
-
-
             # Turn on testing mode
             with torch.no_grad():
                 rgbs, disps = render_path(render_poses, hwf, K, args.chunk, render_kwargs_test)
@@ -1023,6 +1162,13 @@ def train():
             #     imageio.mimwrite(moviebase + 'rgb_still.mp4', to8b(rgbs_still), fps=30, quality=8)
 
         if i%args.i_testset==0 and i > 0:
+            timer_started = False
+            time_elapsed = time.time()-time0
+            str_time_info = '{:d} iters done, {:.0f}m {:.0f}s passed. PSNR: {:.5f}'.format(i, time_elapsed // 60, time_elapsed % 60, psnr.item())
+            time_file = os.path.join(basedir, expname, 'time.txt')
+            with open(time_file, 'a+') as f:
+                f.write(str_time_info +'\n')
+
             testsavedir = os.path.join(basedir, expname, 'testset_{:06d}'.format(i))
             os.makedirs(testsavedir, exist_ok=True)
             print('test poses shape', poses[i_test].shape)

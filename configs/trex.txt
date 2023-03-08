@@ -16,3 +16,5 @@ raw_noise_std = 1e0
 depth_prior = True
 no_ndc = True
 prior_dir = /home/rec/Experiment/ACMM/trex/ACMM/
+prior_percentile = 0.05
+i_testset = 10000

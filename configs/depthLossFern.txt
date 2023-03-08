@@ -1,4 +1,4 @@
-expname = fern_test
+expname = fern_depth_loss
 basedir = ./logs
 datadir = ./data/nerf_llff_data/fern
 dataset_type = llff
@@ -17,4 +17,3 @@ depth_prior = True
 no_ndc = True
 prior_dir = /home/rec/Experiment/ACMM/Fern/ACMM/
 prior_percentile = 0.05
-i_testset = 10000

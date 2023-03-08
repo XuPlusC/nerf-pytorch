@@ -90,10 +90,20 @@ def read_single_depth_ACMM(depth_map_path, scale_factor=1) :
 
 def load_depth_map_ACMM(ACMM_root_folder, scale_factor=1):
     depth_maps = []
+    fused_depth_maps = []
     depth_paths = []
 
     for home, dirs, files in os.walk(ACMM_root_folder):
         for subdir in sorted(dirs):
+            # load fused depth map, stored in a discrete numpy array
+            new_fused_depth_map = []
+            fused_depth_path = ACMM_root_folder + subdir + "/" + "depths_fused.dmb"
+            if os.path.exists(fused_depth_path) :
+                depth_paths.append(fused_depth_path)
+                new_fused_depth_map.append(read_single_depth_ACMM(fused_depth_path, scale_factor))
+                fused_depth_maps.append(new_fused_depth_map)
+                # continue
+
             new_depth_map = []
             # depth map with geometry consistency has priority
             geom_depth_path = ACMM_root_folder + subdir + "/" + "depths_geom.dmb"
@@ -110,4 +120,8 @@ def load_depth_map_ACMM(ACMM_root_folder, scale_factor=1):
                 depth_maps.append(new_depth_map)
 
     depth_maps = np.concatenate(depth_maps, 0)
-    return depth_maps
+    if len(fused_depth_maps) == 0:
+        fused_depth_maps = None
+    else:
+        fused_depth_maps = np.concatenate(fused_depth_maps, 0)
+    return depth_maps, fused_depth_maps

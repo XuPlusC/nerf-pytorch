@@ -1,6 +1,6 @@
-expname = fern_test
+expname = trex_origin
 basedir = ./logs
-datadir = ./data/nerf_llff_data/fern
+datadir = ./data/nerf_llff_data/trex
 dataset_type = llff
 
 factor = 8
@@ -13,8 +13,6 @@ N_importance = 64
 use_viewdirs = True
 raw_noise_std = 1e0
 
-depth_prior = True
+depth_prior = False
 no_ndc = True
-prior_dir = /home/rec/Experiment/ACMM/Fern/ACMM/
-prior_percentile = 0.05
-i_testset = 10000
+prior_dir = /home/rec/Experiment/ACMM/trex/ACMM/

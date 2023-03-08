@@ -1,4 +1,4 @@
-expname = fern_test
+expname = fern_draft_PriorSamplePercentile
 basedir = ./logs
 datadir = ./data/nerf_llff_data/fern
 dataset_type = llff
