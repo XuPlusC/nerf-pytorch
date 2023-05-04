@@ -20,15 +20,25 @@ def read_array_colmap(path):
     array = array.reshape((width, height, channels), order="F")
     return np.transpose(array, (1, 0, 2)).squeeze(), width, height
 
-def read_depth_colmap(depth_map_path, half_res = False):
+def read_depth_colmap(depth_map_path, targetCols, targetRows, scale_factor=1):
     # Read depth and normal maps corresponding to the same image.
     if not os.path.exists(depth_map_path):
         raise FileNotFoundError("File not found: {}".format(depth_map_path))
 
     depth_map, width, height = read_array_colmap(depth_map_path)
 
-    if half_res:
+    if scale_factor != 1:
         depth_map = cv2.resize(depth_map, (width//2, height//2), interpolation=cv2.INTER_AREA)
+        new_size = (int(width/scale_factor), int(height/scale_factor))
+        depth_map = cv2.resize(depth_map, new_size)
+    
+    currentRows = depth_map.shape[0]
+    currentCols = depth_map.shape[1]
+    paddingRowsUp = int((targetRows - currentRows) / 2)
+    paddingRowsDown = targetRows - currentRows - paddingRowsUp
+    paddingColsLeft = int((targetCols - currentCols) / 2)
+    paddingColsRight = targetCols - currentCols - paddingColsLeft
+    depth_map = np.pad(depth_map, ((paddingRowsUp, paddingRowsDown), (paddingColsLeft, paddingColsRight)), 'constant')
     return depth_map
     # min_depth, max_depth = np.percentile(
     #     depth_map, [args.min_depth_percentile, args.max_depth_percentile])
@@ -43,19 +53,26 @@ def read_depth_colmap(depth_map_path, half_res = False):
     # plt.title("depth map")
     # plt.show()
 
-def load_depth_map_colmap(depth_map_folder, half_res = False):
+def load_depth_map_colmap(depth_map_folder, targetCols, targetRows, scale_factor=1, type="g"):
     depth_maps = []
+    files = os.listdir(depth_map_folder)
+    files.sort()
+    depthType = "geometric"
+    if type != "g":
+        depthType = "photometric"
 
-    for filename in os.listdir(depth_map_folder):
-        if filename.find("geometric") != -1 :
-            depth_map = read_depth_colmap(depth_map_folder + "/" + filename, half_res)
-            depth_maps.append(depth_map)
+    for filename in files:
+        if filename.find(depthType) != -1 :
+            new_depth_map = []
+            depth_map = read_depth_colmap(depth_map_folder + "/" + filename, targetCols, targetRows, scale_factor)
+            new_depth_map.append(depth_map)
             # if depth_map.shape != [800, 800] :
             #     # TODO: 若要使用colmap的深度图，则存在问题：其结果可能会被裁减，长宽均不是原始图像尺寸，此时只能居中填充 
             #     # 暂时不管了，用ACMM的深度图，是原尺寸 by cococat
             #     print(depth_map.shape)
             #     print("NOOOOOOOOOOOOOOO!")
-
+            depth_maps.append(new_depth_map)
+    depth_maps = np.concatenate(depth_maps, 0)
     return depth_maps
 
 
@@ -83,7 +100,7 @@ def read_single_depth_ACMM(depth_map_path, scale_factor=1) :
         # cv2.imwrite("/home/rec/Experiment/readFromACMMtest.tiff", converted);
 
         depth_map = depth_map.squeeze()
-        if scale_factor is not 1:
+        if scale_factor != 1:
             new_size = (int(width/scale_factor), int(height/scale_factor))
             depth_map = cv2.resize(depth_map, new_size)
         return depth_map

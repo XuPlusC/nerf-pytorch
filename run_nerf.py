@@ -952,6 +952,7 @@ def train():
         rays_depth_rgb = torch.Tensor(rays_depth_rgb).to(device)
 
 
+    # N_iters = 50000 + 1 # N_iters = 200000 + 1
     N_iters = 200000 + 1
     print('Begin')
     print('TRAIN views are', i_train)
@@ -964,7 +965,7 @@ def train():
     start = start + 1
     timer_started = True
     time0 = time.time()
-    need_prior_assist=True
+    need_prior_assist=True #TODO:
     depth_sample_percentile=1.
     depth_sample_decrease=0.005
     coarse_depth_prior_assist=True # 最初由粗糙深度指导采样，随后如果存在融合深度，则切换成融合深度
@@ -1072,7 +1073,7 @@ def train():
                 depth_sample_decrease = 0.01
             else:
                 depth_sample_decrease = 0.005
-            depth_sample_percentile = depth_sample_percentile - depth_sample_decrease
+            depth_sample_percentile = depth_sample_percentile - depth_sample_decrease # 消融实验，关闭退化
             print("depth_sample_percentile set to " + str(depth_sample_percentile))
             
             if depth_sample_percentile <= 0.:
